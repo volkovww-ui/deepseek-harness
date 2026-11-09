@@ -393,6 +393,40 @@ describe('provider-routed retry policy', () => {
     expect(adapter.requests).toHaveLength(2)
   })
 
+  it('waits for the complete two-minute budget hint before dispatching another request', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      new LlmError('temporary in-flight budget', 'RATE_LIMIT', { status: 402, providerRetryAfterMs: 120_000 }),
+      textResponse('done'),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig({
+      backoff: { maxDelayMs: 120_000, jitterRatio: 0 },
+    }) }))
+    const agent = await context.agentLoop.create(SessionId('retry-inflight-budget'), { provider: 'mock', model: 'mock' })
+    const scheduled = waitForRetry(context, agent, 1)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    expect((await scheduled).data).toMatchObject({ delayMs: 120_000, failure: { code: 'RATE_LIMIT', status: 402, providerRetryAfterMs: 120_000 } })
+    const idle = waitForIdle(context, agent)
+    await vi.advanceTimersByTimeAsync(119_999)
+    expect(adapter.requests).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await idle
+    expect(adapter.requests).toHaveLength(2)
+  })
+
+  it('does not retry an actual credit shortage even when a two-minute hint is present', async () => {
+    const adapter = new ScriptedAdapter([
+      new LlmError('insufficient credits', 'QUOTA', { status: 402, providerRetryAfterMs: 120_000 }),
+    ])
+    ;({ ctx: context } = await harness(adapter, { mock: normalConfig({ backoff: { maxDelayMs: 120_000 } }) }))
+    const agent = await context.agentLoop.create(SessionId('retry-credit-shortage'), { provider: 'mock', model: 'mock' })
+    const idle = waitForIdle(context, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await idle
+    expect(adapter.requests).toHaveLength(1)
+    expect(agent.session.snapshotEvents().some(event => event.type === 'llm/retry')).toBe(false)
+  })
+
   it('uses a bounded provider Retry-After verbatim and delegates an over-cap instruction', async () => {
     vi.useFakeTimers()
     const accepted = new ScriptedAdapter([

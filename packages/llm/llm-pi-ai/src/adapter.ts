@@ -47,6 +47,7 @@ import {
 import type {
   GenerateOptions,
   ImageAttachmentAccess,
+  LlmFailure,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
@@ -234,6 +235,28 @@ function requestHeaderDiagnostic(error: unknown): string {
   return error instanceof Error
     ? error.message
     : 'the contributing plugin threw a non-Error value; throw an Error with a safe diagnostic'
+}
+
+type PaymentFailure = Pick<LlmFailure, 'code' | 'status' | 'providerRetryAfterMs'>
+
+async function paymentFailure(response: Response): Promise<PaymentFailure> {
+  const terminal = { code: 'QUOTA', status: 402 }
+  const retry = response.headers.get('retry-after')
+  const delay = retry === null ? NaN : /^\d+(?:\.\d+)?$/u.test(retry)
+    ? Number(retry) * 1000 : retry.endsWith(' GMT') ? Math.max(0, Date.parse(retry) - Date.now()) : NaN
+  if (!Number.isFinite(delay)) return terminal
+  let raw: unknown
+  try {
+    raw = await response.clone().json()
+  } catch (_error) {
+    return terminal
+  }
+  const error = typeof raw === 'object' && raw !== null && 'error' in raw ? raw.error : undefined
+  const metadata = typeof error === 'object' && error !== null && 'metadata' in error ? error.metadata : undefined
+  if (typeof metadata !== 'object' || metadata === null
+    || !('reason' in metadata) || metadata.reason !== 'in_flight_budget_exhausted'
+    || !('limit_source' in metadata) || metadata.limit_source !== 'openrouter_in_flight_budget') return terminal
+  return { code: 'RATE_LIMIT', status: 402, ...delay > 0 ? { providerRetryAfterMs: delay } : {} }
 }
 
 /** Prepare request-owned headers without allowing contributors to replace attribution. */
@@ -457,8 +480,16 @@ export class PiAiAdapter extends LlmAdapter {
             maxBytes: profile.requestImageMaxBytes,
           },
         }, onReplayDegrade, updates.systemPromptUpdate === 'in-history')
+      let payment: PaymentFailure | undefined
+      const paymentFetch: typeof fetch = async (input, init) => {
+        const response = await fetch(input, init)
+        if (response.status === 402) payment = await paymentFailure(response)
+        return response
+      }
       const events = snapshot.models.streamSimple(model, context, {
         ...profileOptions(profile, reasoning, apiKey),
+        ...['openai-completions', 'openai-responses', 'anthropic-messages'].includes(model.api)
+          ? { fetch: paymentFetch } : {},
         ...options.temperature === undefined ? {} : { temperature: options.temperature },
         ...options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens },
         ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
@@ -474,7 +505,10 @@ export class PiAiAdapter extends LlmAdapter {
             exhausted = true
             return
           }
-          yield result.value
+          const chunk = result.value
+          yield payment !== undefined && chunk.type === 'finish' && chunk.reason.kind === 'error'
+            ? { ...chunk, reason: { ...chunk.reason, failure: { ...chunk.reason.failure, ...payment } } }
+            : chunk
         }
       } finally {
         if (!exhausted) {

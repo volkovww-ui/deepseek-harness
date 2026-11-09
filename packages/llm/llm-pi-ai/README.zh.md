@@ -35,7 +35,7 @@ kind: "package-reference"
 
 ### 配置提供方路由
 
-每个 profile 都可以设置 `retryPolicy`；省略时使用 normal mode、最多重试五次。`apiKeyEnv` 是按请求经 harness 凭据 seam 解析的凭据引用，因此配置文件绝不包含密钥；解析为空的引用会让请求以 `MISSING_CREDENTIAL` 失败。省略它会让路由保持已配置但无密钥（configured-but-keyless）状态，对已安装目录路由而言即交由 pi-ai 提供方原生的环境发现。
+每个 profile 都可以设置 `retryPolicy`；省略时使用 normal mode、最多重试五次。`openrouter` 路由的 `retryPolicy.backoff.maxDelayMs` 默认为 `120000`，可容纳服务端要求的两分钟等待；其他路由默认为 `10000`。显式配置的上限始终优先。`apiKeyEnv` 是按请求经 harness 凭据 seam 解析的凭据引用，因此配置文件绝不包含密钥；解析为空的引用会让请求以 `MISSING_CREDENTIAL` 失败。省略它会让路由保持已配置但无密钥（configured-but-keyless）状态，对已安装目录路由而言即交由 pi-ai 提供方原生的环境发现。
 
 ```yaml
 - name: '@deepseek-ai/dsh-llm-pi-ai'
@@ -194,6 +194,8 @@ git add packages/llm/llm-pi-ai/src/provider-data.generated.ts
 ### 回放与词汇
 
 成功 assistant 响应会存储带版本的、无损 JSON 回放状态，与产生它们的提供方和模型放在一起——响应级事实加每个流式块一条逐块条目。请求时，`LlmRuntime` 仅当同一适配器实例拥有两条路由时才传递回放状态；适配器校验它并恢复原生响应 id、提供方签名与可选的 `providerThinkingLevel` effort 元数据，缺失的 effort 元数据仍保持缺失。回放会对照 assistant 来源校验请求模型身份，并用它保留同模型签名；提供方报告的响应模型仅作为诊断元数据。回放状态缺失或无法使用时会降级为提供方无关内容，并保留 assistant 来源中必需的提供方和模型。pi-ai 工具调用参数是解析后的对象，因此适配器解析输入并重新字符串化输出，以符合 harness 原始 JSON 约定；pi-ai 流内错误事件映射为终止 `finish` 分片。 协议转换仅作用于请求副本。从 A 切换到 B 再切回 A 时，存储的内容保持完整，包括空文本块、工具 id、原始块顺序和原生回放元数据；发给不同提供方、API 或模型的请求会省略不受支持的签名和推理块。缺少原生元数据的降级回放也会省略推理。切回原模型时，有效的原生回放会保留已存储的推理。
+
+对于 `openai-completions`、`openai-responses` 和 `anthropic-messages`，流式输出开始前返回的 HTTP 402 会保留状态码和经过校验的重试元数据。只有当 `error.metadata.reason` 等于 `in_flight_budget_exhausted`、`error.metadata.limit_source` 等于 `openrouter_in_flight_budget`，且存在有效的 `Retry-After` 时，才产生 `RATE_LIMIT`；其他 HTTP 402 响应产生 `QUOTA`。normal 重试策略不重试 `QUOTA`。重试插件负责等待、上限和取消；适配器不执行隐藏重试。
 
 </details>
 

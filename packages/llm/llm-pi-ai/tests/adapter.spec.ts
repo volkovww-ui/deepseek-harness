@@ -474,6 +474,41 @@ describe('PiAiAdapter provider routing', () => {
     expect(server.paths).toEqual(['/chat/completions'])
   })
 
+  it.each([
+    ['in_flight_budget_exhausted', 'openrouter_in_flight_budget', '120', 'RATE_LIMIT', 120_000],
+    ['in_flight_budget_exhausted', 'openrouter_in_flight_budget', '0', 'RATE_LIMIT', undefined],
+    ['in_flight_budget_exhausted', 'openrouter_in_flight_budget', '-1', 'QUOTA', undefined],
+    ['in_flight_budget_exhausted', 'openrouter_in_flight_budget', undefined, 'QUOTA', undefined],
+    ['in_flight_budget_exhausted', 'openrouter_in_flight_budget', 'invalid', 'QUOTA', undefined],
+    ['weight_exceeds_budget', 'openrouter_credits', '120', 'QUOTA', undefined],
+    ['in_flight_budget_exhausted', 'openrouter_key_limit', '120', 'QUOTA', undefined],
+    [undefined, undefined, '120', 'QUOTA', undefined],
+  ] as const)('preserves HTTP 402 retry metadata for %s/%s with Retry-After %s', async (reason, limitSource, delay, code, delayMs) => {
+    const server = await mockServer([{
+      status: 402,
+      headers: delay === undefined ? {} : { 'Retry-After': delay },
+      body: JSON.stringify({ error: {
+        code: 402,
+        message: 'opaque gateway rejection',
+        metadata: { reason, limit_source: limitSource },
+      } }),
+    }])
+    const ctx = await harness(server.url)
+    const result = await assemble(ctx, { model: 'deepseek-flash', messages: [] })
+    expect(result.finish).toMatchObject({ kind: 'error', failure: { code, status: 402 } })
+    if (result.finish.kind !== 'error') throw new Error('expected provider failure')
+    expect(result.finish.failure.providerRetryAfterMs).toBe(delayMs)
+    expect(server.requests).toHaveLength(1)
+  })
+
+  it('allows the OpenRouter two-minute hint without widening an explicit retry cap', () => {
+    expect(resolveProfiles({ openrouter: {} }).get('openrouter')?.retryPolicy.maxDelayMs).toBe(120_000)
+    expect(resolveProfiles({ deepseek: {} }).get('deepseek')?.retryPolicy.maxDelayMs).toBe(10_000)
+    expect(resolveProfiles({ openrouter: { retryPolicy: {
+      mode: 'normal', backoff: { maxDelayMs: 5_000 },
+    } } }).get('openrouter')?.retryPolicy.maxDelayMs).toBe(5_000)
+  })
+
   it('uses the resolved catalog context window for usage-based overflow detection', async () => {
     const model = getBuiltinModels('deepseek').find(candidate => candidate.id === 'deepseek-flash')
     if (model === undefined) throw new Error('deepseek-flash missing from pi-ai test catalog')

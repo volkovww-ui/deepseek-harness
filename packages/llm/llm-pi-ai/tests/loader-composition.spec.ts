@@ -14,6 +14,7 @@ import AuthorizationService from '@deepseek-ai/dsh-authorization'
 import LocalCredentialProvider from '@deepseek-ai/dsh-credentials-local'
 import { profileComposition } from '../../../settings/settings/tests/profile-composition.ts'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
+import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { assemble } from './assemble.ts'
 import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
 
@@ -88,6 +89,33 @@ async function loadComposition(): Promise<{ ctx: Context; settingsPath: string }
 }
 
 describe('llm-pi-ai real dormant composition', () => {
+  it.each([
+    ['in_flight_budget_exhausted', 'openrouter_in_flight_budget', 'RATE_LIMIT', 120_000],
+    ['weight_exceeds_budget', 'openrouter_credits', 'QUOTA', undefined],
+  ] as const)('retains %s HTTP metadata through the Loader-mounted adapter', async (reason, source, code, delayMs) => {
+    const server = await mockServer([{
+      status: 402,
+      headers: { 'Retry-After': '120' },
+      body: JSON.stringify({ error: { code: 402, message: 'opaque gateway rejection', metadata: { reason, limit_source: source } } }),
+    }])
+    const { ctx, settingsPath } = await loadComposition()
+    await writeFile(settingsPath, [
+      '- id: llm-pi-ai', '  config:', '    providers:', '      openrouter:',
+      '        apiKeyEnv: PI_COMPOSITION_KEY', `        baseURL: ${server.url}`, '',
+    ].join('\n'))
+    await vi.waitFor(() => {
+      expect(ctx.llm.listProviders().map(provider => provider.id)).toEqual(['openrouter'])
+    }, { timeout: 5000 })
+    const model = getBuiltinModels('openrouter')[0]
+    if (model === undefined) throw new Error('OpenRouter catalog is empty')
+    const result = await assemble(ctx, { provider: 'openrouter', model: model.id, messages: [] })
+    expect(result.finish).toMatchObject({ kind: 'error', failure: { code, status: 402 } })
+    if (result.finish.kind !== 'error') throw new Error('expected provider failure')
+    expect(result.finish.failure.providerRetryAfterMs).toBe(delayMs)
+    expect(ctx.llm.providerRetryPolicy('openrouter')?.maxDelayMs).toBe(120_000)
+    expect(server.requests).toHaveLength(1)
+  })
+
   it('dispatches header contributors through the Loader-mounted adapter', async () => {
     const server = await mockServer([{ events: textEvents }])
     const { ctx, settingsPath } = await loadComposition()

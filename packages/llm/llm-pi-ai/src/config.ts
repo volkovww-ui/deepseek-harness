@@ -538,7 +538,12 @@ export function resolveProfiles(
       imageOffloadCountQuantum,
       requestImagePixelBudget,
       requestImageMaxBytes,
-      retryPolicy: resolveRetryPolicy(retryPolicy, `llm-pi-ai: provider "${provider}" retryPolicy`),
+      retryPolicy: resolveRetryPolicy(provider === 'openrouter'
+        ? { ...(retryPolicy ?? { mode: 'normal' as const }), backoff: {
+          ...retryPolicy?.backoff,
+          maxDelayMs: retryPolicy?.backoff?.maxDelayMs ?? 120_000,
+        } }
+        : retryPolicy, `llm-pi-ai: provider "${provider}" retryPolicy`),
       ...rest.headers === undefined ? {} : { headers: { ...rest.headers } },
       ...rest.thinkingBudgets === undefined ? {} : { thinkingBudgets: { ...rest.thinkingBudgets } },
       configuredMaxTokens: catalog?.configuredMaxTokens ?? new Map(),
